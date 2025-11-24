@@ -10,7 +10,7 @@ use core::fmt;
 
 use bitflags::bitflags;
 
-use crate::asm::asm_td_call;
+use crate::{asm::asm_td_call, TdAttributes};
 
 /// TDCALL Instruction Leaf Numbers Definition.
 #[repr(u64)]
@@ -34,26 +34,8 @@ pub enum TdcallNum {
 }
 
 bitflags! {
-    /// GuestTdAttributes is defined as a 64b field that specifies various guest TD attributes.
-    /// It is reported to the guest TD by TDG.VP.INFO and as part of TDREPORT_STRUCT returned by TDG.MR.REPORT.
-    pub struct GuestTdAttributes: u64 {
-        /// Guest TD runs in off-TD debug mode.
-        /// Its VCPU state and private memory are accessible by the host VMM.
-        const DEBUG = 1 << 0;
-        /// TD is migratable (using a Migration TD).
-        const MIGRATABLE = 1 << 29;
-        /// TD is allowed to use Supervisor Protection Keys.
-        const PKS = 1 << 30;
-        /// TD is allowed to use Key Locker. Must be 0.
-        const KL = 1 << 31;
-        /// TD is allowed to use Perfmon and PERF_METRICS capabilities.
-        const PERFMON = 1 << 63;
-    }
-}
-
-bitflags! {
     /// Controls whether CPUID executed by the guest TD will cause #VE unconditionally.
-    struct CpuidveFlag: u64 {
+    pub struct CpuidveFlag: u64 {
         /// Flags that when CPL is 0, a CPUID executed
         /// by the guest TD will cause a #VE unconditionally.
         const SUPERVISOR = 1 << 0;
@@ -275,7 +257,7 @@ pub struct TdgVpInfo {
     /// Only GPAW values 48 and 52 are possible.
     pub gpaw: Gpaw,
     /// The TD's ATTRIBUTES (provided as input to TDH.MNG.INIT)
-    pub attributes: GuestTdAttributes,
+    pub attributes: TdAttributes,
     pub num_vcpus: u32,
     pub max_vcpus: u32,
     pub vcpu_index: u32,
@@ -512,7 +494,7 @@ pub fn get_tdinfo() -> Result<TdgVpInfo, TdCallError> {
     td_call(&mut args)?;
     Ok(TdgVpInfo {
         gpaw: Gpaw::from(args.rcx),
-        attributes: GuestTdAttributes::from_bits_truncate(args.rdx),
+        attributes: TdAttributes::from_bits_truncate(args.rdx),
         num_vcpus: args.r8 as u32,
         max_vcpus: (args.r8 >> 32) as u32,
         vcpu_index: args.r9 as u32,
@@ -653,10 +635,10 @@ pub fn write_td_metadata(
 ///
 /// The guest TD may control the same settings by writing to the
 /// VCPU-scope metadata fields CPUID_SUPERVISOR_VE and CPUID_USER_VE using TDG.VP.WR.
-pub fn set_cpuidve(cpuidve_flag: u64) -> Result<(), TdCallError> {
+pub fn set_cpuidve(cpuidve_flag: CpuidveFlag) -> Result<(), TdCallError> {
     let mut args = TdcallArgs {
         rax: TdcallNum::VpCpuidveSet as u64,
-        rcx: cpuidve_flag,
+        rcx: cpuidve_flag.bits(),
         ..Default::default()
     };
     td_call(&mut args)
