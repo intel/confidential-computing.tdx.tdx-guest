@@ -1,6 +1,6 @@
 [package]
 name = "tdx-guest"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "The tdx-guest provides a Rust implementation of Intel® Trust Domain Extensions (Intel® TDX) Guest APIs, supporting for TDX Guest specific instructions, structures and functions."
 license = "BSD-3-Clause"
