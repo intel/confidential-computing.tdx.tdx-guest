@@ -100,12 +100,22 @@ pub fn handle_virtual_exception(trapframe: &mut dyn TdxTrapFrame, ve_info: &TdgV
             unsafe { wrmsr(trapframe.rcx() as u32, data).unwrap() };
         }
         TdxVirtualExceptionType::CpuId => {
-            let cpuid_info = cpuid(trapframe.rax() as u32, trapframe.rcx() as u32).unwrap();
-            let mask = 0xFFFF_FFFF_0000_0000_usize;
-            trapframe.set_rax((trapframe.rax() & mask) | cpuid_info.eax);
-            trapframe.set_rbx((trapframe.rbx() & mask) | cpuid_info.ebx);
-            trapframe.set_rcx((trapframe.rcx() & mask) | cpuid_info.ecx);
-            trapframe.set_rdx((trapframe.rdx() & mask) | cpuid_info.edx);
+            let leaf = trapframe.rax() as u32;
+
+            if leaf >= 0x40000000 && leaf <= 0x400000FF {
+                let cpuid_info = cpuid(leaf, trapframe.rcx() as u32).unwrap();
+                let mask = 0xFFFF_FFFF_0000_0000_usize;
+                trapframe.set_rax((trapframe.rax() & mask) | cpuid_info.eax);
+                trapframe.set_rbx((trapframe.rbx() & mask) | cpuid_info.ebx);
+                trapframe.set_rcx((trapframe.rcx() & mask) | cpuid_info.ecx);
+                trapframe.set_rdx((trapframe.rdx() & mask) | cpuid_info.edx);
+            } else {
+                    let mask = 0xFFFF_FFFF_0000_0000_usize;
+                    trapframe.set_rax(trapframe.rax() & mask);
+                    trapframe.set_rbx(trapframe.rbx() & mask);
+                    trapframe.set_rcx(trapframe.rcx() & mask);
+                    trapframe.set_rdx(trapframe.rdx() & mask);
+            }
         }
         TdxVirtualExceptionType::EptViolation => {
             if is_protected_gpa(ve_info.guest_physical_address as TdxGpa) {
