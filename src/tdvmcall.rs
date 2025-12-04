@@ -11,32 +11,8 @@ extern crate alloc;
 
 use alloc::fmt;
 use core::fmt::Write;
-
 use x86_64::registers::rflags::{self, RFlags};
-
 use crate::asm::asm_td_vmcall;
-
-/// TDVMCALL Instruction Leaf Numbers Definition.
-#[repr(u64)]
-pub enum TdVmcallNum {
-    Cpuid = 0x0000a,
-    Hlt = 0x0000c,
-    Io = 0x0001e,
-    Rdmsr = 0x0001f,
-    Wrmsr = 0x00020,
-    RequestMmio = 0x00030,
-    Wbinvd = 0x00036,
-    GetTdVmcallInfo = 0x10000,
-    Mapgpa = 0x10001,
-    GetQuote = 0x10002,
-    SetupEventNotifyInterrupt = 0x10004,
-    Service = 0x10005,
-}
-
-const SERIAL_IO_PORT: u16 = 0x3F8;
-const SERIAL_LINE_STS: u16 = 0x3FD;
-const IO_READ: u64 = 0;
-const IO_WRITE: u64 = 1;
 
 #[derive(Debug, PartialEq)]
 pub enum TdVmcallError {
@@ -51,29 +27,6 @@ pub enum TdVmcallError {
     Other,
 }
 
-impl From<u64> for TdVmcallError {
-    fn from(val: u64) -> Self {
-        match val {
-            0x1 => Self::TdxRetry,
-            0x8000_0000_0000_0000 => Self::TdxOperandInvalid,
-            0x8000_0000_0000_0001 => Self::TdxGpaInuse,
-            0x8000_0000_0000_0002 => Self::TdxAlignError,
-            _ => Self::Other,
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Default)]
-pub(crate) struct TdVmcallArgs {
-    r10: u64,
-    r11: u64,
-    r12: u64,
-    r13: u64,
-    r14: u64,
-    r15: u64,
-}
-
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct CpuIdInfo {
@@ -81,6 +34,13 @@ pub struct CpuIdInfo {
     pub ebx: usize,
     pub ecx: usize,
     pub edx: usize,
+}
+
+pub enum IoSize {
+    Size1 = 1,
+    Size2 = 2,
+    Size4 = 4,
+    Size8 = 8,
 }
 
 pub enum Direction {
@@ -91,13 +51,6 @@ pub enum Direction {
 pub enum Operand {
     Dx,
     Immediate,
-}
-
-pub enum IoSize {
-    Size1 = 1,
-    Size2 = 2,
-    Size4 = 4,
-    Size8 = 8,
 }
 
 pub fn cpuid(eax: u32, ecx: u32) -> Result<CpuIdInfo, TdVmcallError> {
@@ -126,39 +79,50 @@ pub fn hlt() {
     let _ = td_vmcall(&mut args);
 }
 
-/// # Safety
-/// Make sure the index is valid.
-pub unsafe fn rdmsr(index: u32) -> Result<u64, TdVmcallError> {
-    let mut args = TdVmcallArgs {
-        r11: TdVmcallNum::Rdmsr as u64,
-        r12: index as u64,
-        ..Default::default()
-    };
-    td_vmcall(&mut args)?;
-    Ok(args.r11)
+macro_rules! io_read {
+    ($port:expr, $ty:ty) => {{
+        let mut args = TdVmcallArgs {
+            r11: TdVmcallNum::Io as u64,
+            r12: core::mem::size_of::<$ty>() as u64,
+            r13: IO_READ,
+            r14: $port as u64,
+            ..Default::default()
+        };
+        td_vmcall(&mut args)?;
+        Ok(args.r11 as u32)
+    }};
 }
 
-/// # Safety
-/// Make sure the index and the corresponding value are valid.
-pub unsafe fn wrmsr(index: u32, value: u64) -> Result<(), TdVmcallError> {
-    let mut args = TdVmcallArgs {
-        r11: TdVmcallNum::Wrmsr as u64,
-        r12: index as u64,
-        r13: value,
-        ..Default::default()
-    };
-    td_vmcall(&mut args)
+macro_rules! io_write {
+    ($port:expr, $byte:expr, $size:expr) => {{
+        let mut args = TdVmcallArgs {
+            r11: TdVmcallNum::Io as u64,
+            r12: core::mem::size_of_val(&$byte) as u64,
+            r13: IO_WRITE,
+            r14: $port as u64,
+            r15: $byte as u64,
+            ..Default::default()
+        };
+        td_vmcall(&mut args)
+    }};
 }
 
-/// Used to help perform WBINVD or WBNOINVD operation.
-/// - cache_operation: 0: WBINVD, 1: WBNOINVD
-pub fn perform_cache_operation(cache_operation: u64) -> Result<(), TdVmcallError> {
-    let mut args = TdVmcallArgs {
-        r11: TdVmcallNum::Wbinvd as u64,
-        r12: cache_operation,
-        ..Default::default()
-    };
-    td_vmcall(&mut args)
+pub fn io_read(size: IoSize, port: u16) -> Result<u32, TdVmcallError> {
+    match size {
+        IoSize::Size1 => io_read!(port, u8),
+        IoSize::Size2 => io_read!(port, u16),
+        IoSize::Size4 => io_read!(port, u32),
+        _ => unreachable!(),
+    }
+}
+
+pub fn io_write(size: IoSize, port: u16, byte: u32) -> Result<(), TdVmcallError> {
+    match size {
+        IoSize::Size1 => io_write!(port, byte as u8, u8),
+        IoSize::Size2 => io_write!(port, byte as u16, u16),
+        IoSize::Size4 => io_write!(port, byte, u32),
+        _ => unreachable!(),
+    }
 }
 
 /// # Safety
@@ -201,6 +165,41 @@ pub fn map_gpa(gpa: u64, size: u64) -> Result<(), (u64, TdVmcallError)> {
         ..Default::default()
     };
     td_vmcall(&mut args).map_err(|e| (args.r11, e))
+}
+
+/// # Safety
+/// Make sure the index is valid.
+pub unsafe fn rdmsr(index: u32) -> Result<u64, TdVmcallError> {
+    let mut args = TdVmcallArgs {
+        r11: TdVmcallNum::Rdmsr as u64,
+        r12: index as u64,
+        ..Default::default()
+    };
+    td_vmcall(&mut args)?;
+    Ok(args.r11)
+}
+
+/// # Safety
+/// Make sure the index and the corresponding value are valid.
+pub unsafe fn wrmsr(index: u32, value: u64) -> Result<(), TdVmcallError> {
+    let mut args = TdVmcallArgs {
+        r11: TdVmcallNum::Wrmsr as u64,
+        r12: index as u64,
+        r13: value,
+        ..Default::default()
+    };
+    td_vmcall(&mut args)
+}
+
+/// Used to help perform WBINVD or WBNOINVD operation.
+/// - cache_operation: 0: WBINVD, 1: WBNOINVD
+pub fn perform_cache_operation(cache_operation: u64) -> Result<(), TdVmcallError> {
+    let mut args = TdVmcallArgs {
+        r11: TdVmcallNum::Wbinvd as u64,
+        r12: cache_operation,
+        ..Default::default()
+    };
+    td_vmcall(&mut args)
 }
 
 /// GetQuote TDG.VP.VMCALL is a doorbell-like interface used to help send a message to the
@@ -290,51 +289,58 @@ pub fn get_td_service(
     td_vmcall(&mut args)
 }
 
-macro_rules! io_read {
-    ($port:expr, $ty:ty) => {{
-        let mut args = TdVmcallArgs {
-            r11: TdVmcallNum::Io as u64,
-            r12: core::mem::size_of::<$ty>() as u64,
-            r13: IO_READ,
-            r14: $port as u64,
-            ..Default::default()
-        };
-        td_vmcall(&mut args)?;
-        Ok(args.r11 as u32)
-    }};
+pub fn print(args: fmt::Arguments) {
+    Serial
+        .write_fmt(args)
+        .expect("Failed to write to serial port");
 }
 
-pub fn io_read(size: IoSize, port: u16) -> Result<u32, TdVmcallError> {
-    match size {
-        IoSize::Size1 => io_read!(port, u8),
-        IoSize::Size2 => io_read!(port, u16),
-        IoSize::Size4 => io_read!(port, u32),
-        _ => unreachable!(),
+#[macro_export]
+macro_rules! serial_print {
+    ($fmt: literal $(, $($arg: tt)+)?) => {
+        $crate::tdvmcall::print(format_args!($fmt $(, $($arg)+)?));
     }
 }
 
-macro_rules! io_write {
-    ($port:expr, $byte:expr, $size:expr) => {{
-        let mut args = TdVmcallArgs {
-            r11: TdVmcallNum::Io as u64,
-            r12: core::mem::size_of_val(&$byte) as u64,
-            r13: IO_WRITE,
-            r14: $port as u64,
-            r15: $byte as u64,
-            ..Default::default()
-        };
-        td_vmcall(&mut args)
-    }};
-}
-
-pub fn io_write(size: IoSize, port: u16, byte: u32) -> Result<(), TdVmcallError> {
-    match size {
-        IoSize::Size1 => io_write!(port, byte as u8, u8),
-        IoSize::Size2 => io_write!(port, byte as u16, u16),
-        IoSize::Size4 => io_write!(port, byte, u32),
-        _ => unreachable!(),
+#[macro_export]
+macro_rules! serial_println {
+    ($fmt: literal $(, $($arg: tt)+)?) => {
+        $crate::tdvmcall::print(format_args!(concat!($fmt, "\n") $(, $($arg)+)?))
     }
 }
+
+/// TDVMCALL Instruction Leaf Numbers Definition.
+#[repr(u64)]
+pub enum TdVmcallNum {
+    Cpuid = 0x0000a,
+    Hlt = 0x0000c,
+    Io = 0x0001e,
+    Rdmsr = 0x0001f,
+    Wrmsr = 0x00020,
+    RequestMmio = 0x00030,
+    Wbinvd = 0x00036,
+    GetTdVmcallInfo = 0x10000,
+    Mapgpa = 0x10001,
+    GetQuote = 0x10002,
+    SetupEventNotifyInterrupt = 0x10004,
+    Service = 0x10005,
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct TdVmcallArgs {
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+}
+
+const SERIAL_IO_PORT: u16 = 0x3F8;
+const SERIAL_LINE_STS: u16 = 0x3FD;
+const IO_READ: u64 = 0;
+const IO_WRITE: u64 = 1;
 
 fn td_vmcall(args: &mut TdVmcallArgs) -> Result<(), TdVmcallError> {
     let result = unsafe { asm_td_vmcall(args) };
@@ -355,22 +361,14 @@ impl Write for Serial {
     }
 }
 
-pub fn print(args: fmt::Arguments) {
-    Serial
-        .write_fmt(args)
-        .expect("Failed to write to serial port");
-}
-
-#[macro_export]
-macro_rules! serial_print {
-    ($fmt: literal $(, $($arg: tt)+)?) => {
-        $crate::tdvmcall::print(format_args!($fmt $(, $($arg)+)?));
-    }
-}
-
-#[macro_export]
-macro_rules! serial_println {
-    ($fmt: literal $(, $($arg: tt)+)?) => {
-        $crate::tdvmcall::print(format_args!(concat!($fmt, "\n") $(, $($arg)+)?))
+impl From<u64> for TdVmcallError {
+    fn from(val: u64) -> Self {
+        match val {
+            0x1 => Self::TdxRetry,
+            0x8000_0000_0000_0000 => Self::TdxOperandInvalid,
+            0x8000_0000_0000_0001 => Self::TdxGpaInuse,
+            0x8000_0000_0000_0002 => Self::TdxAlignError,
+            _ => Self::Other,
+        }
     }
 }

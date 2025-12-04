@@ -24,12 +24,22 @@ pub use self::{
     tdvmcall::{cpuid, hlt, print, rdmsr, wrmsr},
 };
 
-pub const SHARED_BIT: u8 = 51;
-pub const SHARED_MASK: u64 = 1u64 << SHARED_BIT;
+#[derive(Debug)]
+pub enum TopologyError {
+    TdCall(tdcall::TdCallError),
+    NotConfigured,
+}
 
-static TDX_ENABLED: AtomicBool = AtomicBool::new(false);
+#[derive(Debug)]
+pub enum SeptVeError {
+    TdCall(tdcall::TdCallError),
+    Misconfiguration,
+}
 
 pub type TdxGpa = usize;
+
+pub const SHARED_BIT: u8 = 51;
+pub const SHARED_MASK: u64 = 1u64 << SHARED_BIT;
 
 pub trait TdxTrapFrame {
     fn rax(&self) -> usize;
@@ -92,8 +102,8 @@ pub fn handle_virtual_exception(trapframe: &mut dyn TdxTrapFrame, ve_info: &TdgV
         }
         TdxVirtualExceptionType::MsrRead => {
             let msr = unsafe { rdmsr(trapframe.rcx() as u32).unwrap() };
-            trapframe.set_rax((msr as u32 & u32::MAX) as usize);
-            trapframe.set_rdx(((msr >> 32) as u32 & u32::MAX) as usize);
+            trapframe.set_rax((msr as u32) as usize);
+            trapframe.set_rdx(((msr >> 32) as u32) as usize);
         }
         TdxVirtualExceptionType::MsrWrite => {
             let data = trapframe.rax() as u64 | ((trapframe.rdx() as u64) << 32);
@@ -189,77 +199,6 @@ pub fn disable_sept_ve(td_attr: TdAttributes) -> Result<(), SeptVeError> {
     Ok(())
 }
 
-pub(crate) fn is_protected_gpa(gpa: TdxGpa) -> bool {
-    (gpa as u64 & SHARED_MASK) == 0
-}
-
-fn check_tdx_guest() -> Result<(), InitError> {
-    const TDX_CPUID_LEAF_ID: u64 = 0x21;
-    let cpuid_leaf = cpuid_count(0, 0).eax as u64;
-    if cpuid_leaf < TDX_CPUID_LEAF_ID {
-        return Err(InitError::TdxCpuLeafIdError);
-    }
-    let cpuid_result: CpuIdResult = cpuid_count(TDX_CPUID_LEAF_ID as u32, 0);
-    if &cpuid_result.ebx.to_ne_bytes() != b"Inte"
-        || &cpuid_result.edx.to_ne_bytes() != b"lTDX"
-        || &cpuid_result.ecx.to_ne_bytes() != b"    "
-    {
-        return Err(InitError::TdxVendorIdError);
-    }
-    Ok(())
-}
-
-pub mod metadata {
-    /// Non-attested TD configuration flags.
-    pub const CONFIG_FLAGS: u64 = 0x1110000300000016;
-    /// A bitmap of TD controls that may be modified during TD run time.
-    pub const TD_CTLS: u64 = 0x1110000300000017;
-    /// Enable guest notification of events.
-    pub const NOTIFY_ENABLES: u64 = 0x9100000000000010;
-    /// Indicates whether virtual topology enumeration has been successfully configured.
-    pub const TOPOLOGY_ENUM_CONFIGURED: u64 = 0x9100000000000019;
-
-    use crate::bitflags;
-    bitflags! {
-        /// TD Control flags
-        pub struct TdCtls: u64 {
-            /// Controls the way guest TD access to a PENDING page is processed.
-            const PENDING_VE_DISABLE = 1 << 0;
-            /// Controls the enumeration of virtual platform topology.
-            const ENUM_TOPOLOGY = 1 << 1;
-            /// Controls the virtualization of CPUID(2).
-            const VIRT_CPUID2 = 1 << 2;
-            /// Allows the guest TD to control the way #VE is injected by the TDX module
-            /// on guest TD execution of CPUID, RDMSR/WRMSR and other instructions.
-            const REDUCE_VE = 1 << 3;
-            /// Controls whether a migratable TD can request a sealing key using TDG.MR.KEY.GET.
-            const FORCE_HW_KEYS = 1 << 4;
-            /// Controls locking of TD-writable virtualization controls.
-            const LOCK = 1 << 63;
-        }
-    }
-}
-
-bitflags! {
-    pub struct ConfigFlags: u64 {
-        /// GPAW (Guest Physical Address Width) controls the position of the SHARED bit in GPA.
-        /// It is copied to each TD VMCS and L2 VMCS GPAW execution control on TDH.VP.INIT and TDH.IMPORT.STATE.VP.
-        const GPAW = 1 << 0;
-        /// Controls the guest TD’s ability to change the PENDING page access behavior from its default value.
-        const FLEXIBLE_PENDING_VE = 1 << 1;
-        /// Controls whether RBP value can be modified by TDG.VP.VMCALL and TDH.VP.ENTER.
-        const NO_RBP_MOD = 1 << 2;
-        /// Controls virtualization of physical address width, as enumerated by CPUID(0x80000008).EAX[7:0].
-        const MAXPA_VIRT = 1 << 3;
-        /// Controls virtualization of guest physical address width, as enumerated by CPUID(0x80000008).EAX[23:16].
-        const MAXGPA_VIRT = 1 << 4;
-        /// Enables TDX Connect for the current TD.
-        const TDX_CONNECT = 1 << 5;
-        /// Enables TDG.MEM.PAGE.RELEASE for the current TD.
-        const PAGE_RELEASE = 1 << 6;
-    }
-}
-
 bitflags! {
     /// TdAttributes is defined as a 64b field that specifies various attested guest TD attributes.
     pub struct TdAttributes: u64 {
@@ -306,22 +245,83 @@ bitflags! {
     }
 }
 
-#[derive(Debug)]
-pub enum TopologyError {
-    TdCall(tdcall::TdCallError),
-    NotConfigured,
+pub mod metadata {
+    /// Non-attested TD configuration flags.
+    pub const CONFIG_FLAGS: u64 = 0x1110000300000016;
+    /// A bitmap of TD controls that may be modified during TD run time.
+    pub const TD_CTLS: u64 = 0x1110000300000017;
+    /// Enable guest notification of events.
+    pub const NOTIFY_ENABLES: u64 = 0x9100000000000010;
+    /// Indicates whether virtual topology enumeration has been successfully configured.
+    pub const TOPOLOGY_ENUM_CONFIGURED: u64 = 0x9100000000000019;
+
+    use crate::bitflags;
+    bitflags! {
+        /// TD Control flags
+        pub struct TdCtls: u64 {
+            /// Controls the way guest TD access to a PENDING page is processed.
+            const PENDING_VE_DISABLE = 1 << 0;
+            /// Controls the enumeration of virtual platform topology.
+            const ENUM_TOPOLOGY = 1 << 1;
+            /// Controls the virtualization of CPUID(2).
+            const VIRT_CPUID2 = 1 << 2;
+            /// Allows the guest TD to control the way #VE is injected by the TDX module
+            /// on guest TD execution of CPUID, RDMSR/WRMSR and other instructions.
+            const REDUCE_VE = 1 << 3;
+            /// Controls whether a migratable TD can request a sealing key using TDG.MR.KEY.GET.
+            const FORCE_HW_KEYS = 1 << 4;
+            /// Controls locking of TD-writable virtualization controls.
+            const LOCK = 1 << 63;
+        }
+    }
+}
+
+static TDX_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn is_protected_gpa(gpa: TdxGpa) -> bool {
+    (gpa as u64 & SHARED_MASK) == 0
+}
+
+fn check_tdx_guest() -> Result<(), InitError> {
+    const TDX_CPUID_LEAF_ID: u64 = 0x21;
+    let cpuid_leaf = cpuid_count(0, 0).eax as u64;
+    if cpuid_leaf < TDX_CPUID_LEAF_ID {
+        return Err(InitError::TdxCpuLeafIdError);
+    }
+    let cpuid_result: CpuIdResult = cpuid_count(TDX_CPUID_LEAF_ID as u32, 0);
+    if &cpuid_result.ebx.to_ne_bytes() != b"Inte"
+        || &cpuid_result.edx.to_ne_bytes() != b"lTDX"
+        || &cpuid_result.ecx.to_ne_bytes() != b"    "
+    {
+        return Err(InitError::TdxVendorIdError);
+    }
+    Ok(())
+}
+
+bitflags! {
+    struct ConfigFlags: u64 {
+        /// GPAW (Guest Physical Address Width) controls the position of the SHARED bit in GPA.
+        /// It is copied to each TD VMCS and L2 VMCS GPAW execution control on TDH.VP.INIT and TDH.IMPORT.STATE.VP.
+        const GPAW = 1 << 0;
+        /// Controls the guest TD’s ability to change the PENDING page access behavior from its default value.
+        const FLEXIBLE_PENDING_VE = 1 << 1;
+        /// Controls whether RBP value can be modified by TDG.VP.VMCALL and TDH.VP.ENTER.
+        const NO_RBP_MOD = 1 << 2;
+        /// Controls virtualization of physical address width, as enumerated by CPUID(0x80000008).EAX[7:0].
+        const MAXPA_VIRT = 1 << 3;
+        /// Controls virtualization of guest physical address width, as enumerated by CPUID(0x80000008).EAX[23:16].
+        const MAXGPA_VIRT = 1 << 4;
+        /// Enables TDX Connect for the current TD.
+        const TDX_CONNECT = 1 << 5;
+        /// Enables TDG.MEM.PAGE.RELEASE for the current TD.
+        const PAGE_RELEASE = 1 << 6;
+    }
 }
 
 impl From<tdcall::TdCallError> for TopologyError {
     fn from(err: tdcall::TdCallError) -> Self {
         TopologyError::TdCall(err)
     }
-}
-
-#[derive(Debug)]
-pub enum SeptVeError {
-    TdCall(tdcall::TdCallError),
-    Misconfiguration,
 }
 
 impl From<tdcall::TdCallError> for SeptVeError {

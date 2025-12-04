@@ -12,15 +12,6 @@ use crate::{
     TdxTrapFrame,
 };
 
-enum InstrMmioType {
-    Write,
-    WriteImm,
-    Read,
-    ReadZeroExtend,
-    ReadSignExtend,
-    Movs,
-}
-
 #[derive(Debug)]
 pub(crate) enum MmioError {
     Unimplemented,
@@ -415,4 +406,13 @@ fn decode_mmio(instr: &Instruction) -> Option<(InstrMmioType, IoSize)> {
         }
         _ => None,
     }
+}
+
+enum InstrMmioType {
+    Write,
+    WriteImm,
+    Read,
+    ReadZeroExtend,
+    ReadSignExtend,
+    Movs,
 }
