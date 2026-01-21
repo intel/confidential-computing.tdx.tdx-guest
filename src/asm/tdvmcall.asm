@@ -9,55 +9,67 @@
 # ABI specification section TDG.VP.VMCALL for detail.
 # Here we expose R10 - R15 to VMM in td_vm_call()
 .equ TDVMCALL_EXPOSE_REGS_MASK, 0xfc00
-
-# TDG.VP.VMCALL leaf number
 .equ TDVMCALL, 0
 
-# Arguments offsets in TdVmcallArgs struct
-.equ VMCALL_R10, 0x0
-.equ VMCALL_R11, 0x8
-.equ VMCALL_R12, 0x10
-.equ VMCALL_R13, 0x18
-.equ VMCALL_R14, 0x20
-.equ VMCALL_R15, 0x28
+.equ VMCALL_R8, 0x0
+.equ VMCALL_R9, 0x8
+.equ VMCALL_R10, 0x10
+.equ VMCALL_R11, 0x18
+.equ VMCALL_R12, 0x20
+.equ VMCALL_R13, 0x28
+.equ VMCALL_R14, 0x30
+.equ VMCALL_R15, 0x38
+.equ VMCALL_RBX, 0x40
+.equ VMCALL_RCX, 0x48
+.equ VMCALL_RDI, 0x50
+.equ VMCALL_RSI, 0x58
+.equ VMCALL_RDX, 0x60
+
+.align 16
 
 .global asm_td_vmcall
 asm_td_vmcall:
         endbr64
+
+        test rdi, rdi
+        jz .L_invalid_input
+
         push rbp
         mov rbp, rsp
-        push r15
-        push r14
-        push r13
-        push r12
         push rbx
+        push r12
+        push r13
+        push r14
+        push r15
 
-        # Test if input pointer is valid
-        test rdi, rdi
-        jz vmcall_exit
+        push rdi
 
-        # Copy the input operands from memory to registers
+        mov r8,  [rdi + VMCALL_R8]
+        mov r9,  [rdi + VMCALL_R9]
         mov r10, [rdi + VMCALL_R10]
         mov r11, [rdi + VMCALL_R11]
         mov r12, [rdi + VMCALL_R12]
         mov r13, [rdi + VMCALL_R13]
         mov r14, [rdi + VMCALL_R14]
         mov r15, [rdi + VMCALL_R15]
+        mov rbx, [rdi + VMCALL_RBX]
+        mov rsi, [rdi + VMCALL_RSI]
+        mov rdx, [rdi + VMCALL_RDX]
 
-        # Set TDCALL leaf number
+        mov rcx, [rdi + VMCALL_RCX]
+        or  rcx, TDVMCALL_EXPOSE_REGS_MASK
+
+        mov rdi, [rdi + VMCALL_RDI]
+
         mov rax, TDVMCALL
 
-        # Set exposed register mask
-        mov ecx, TDVMCALL_EXPOSE_REGS_MASK
+        .byte 0x66, 0x0f, 0x01, 0xcc
 
-        # TDCALL
-       .byte 0x66,0x0f,0x01,0xcc
+        pop rdi
 
-        # RAX should always be zero for TDVMCALL, panic if it is not.
         test rax, rax
-        jnz vmcall_panic
+        jnz .L_tdcall_failed
 
-        # Copy the output operands from registers to the struct
         mov [rdi + VMCALL_R10], r10
         mov [rdi + VMCALL_R11], r11
         mov [rdi + VMCALL_R12], r12
@@ -67,20 +79,20 @@ asm_td_vmcall:
 
         mov rax, r10
 
-vmcall_exit:
-        # Clean the registers that are exposed to VMM to
-        # protect against speculative attack, others will
-        # be restored to the values saved in stack
-        xor r10, r10
-        xor r11, r11
-
-        pop rbx
-        pop r12
-        pop r13
-        pop r14
+.L_cleanup:
         pop r15
+        pop r14
+        pop r13
+        pop r12
+        pop rbx
         pop rbp
         ret
 
-vmcall_panic:
-        ud2
+.L_invalid_input:
+        mov rax, -1
+        ret
+
+.L_tdcall_failed:
+        # Set a specific error code.
+        mov rax, -2
+        jmp .L_cleanup

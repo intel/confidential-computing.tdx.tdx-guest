@@ -296,6 +296,78 @@ pub fn get_td_service(
     td_vmcall(&mut args)
 }
 
+pub fn report_fatal_error_simple(message: &str) -> ! {
+    report_fatal_error(None, Some(message))
+}
+
+pub fn report_fatal_error_with_shared_memory(shared_gpa: u64) -> ! {
+    report_fatal_error(Some(shared_gpa), None)
+}
+
+pub fn report_fatal_error_full(shared_gpa: u64, brief_message: &str) -> ! {
+    report_fatal_error(Some(shared_gpa), Some(brief_message))
+}
+
+pub fn report_fatal_error(shared_gpa: Option<u64>, msg: Option<&str>) -> ! {
+    let mut r12_value: u64 = 0;
+    let mut r13_value: u64 = 0;
+
+    if let Some(gpa) = shared_gpa {
+        r12_value |= 1 << 63;
+        r13_value = gpa;
+    }
+
+    let mut message_regs = [0u64; 8];
+    // According to QEMU source code: R14=14, R15=15, RBX=3, RDI=7, RSI=6, R8=8, R9=9, RDX=2.
+    let qemu_bit_indices = [14, 15, 3, 7, 6, 8, 9, 2];
+
+    // R10-R15 exposure (0xfc00) for use by the TDX Module.
+    // Refer to TDX Module ABI specification section TDG.VP.VMCALL for detail.
+    let mut expose_mask: u64 = 0xfc00;
+
+    if let Some(message) = msg {
+        let mut buffer = [0u8; 64];
+        let bytes = message.as_bytes();
+        let len = bytes.len().min(63);
+        buffer[..len].copy_from_slice(&bytes[..len]);
+
+        for i in 0..8 {
+            let start = i * 8;
+            let mut chunk = [0u8; 8];
+            chunk.copy_from_slice(&buffer[start..start + 8]);
+            message_regs[i] = u64::from_le_bytes(chunk);
+
+            // Enable the mask bit as long as there is data in the register.
+            if message_regs[i] != 0 {
+                expose_mask |= 1 << qemu_bit_indices[i];
+            }
+        }
+    }
+
+    loop {
+        let mut args = TdVmcallArgs {
+            r11: TdVmcallNum::ReportFatalError as u64,
+            r12: r12_value,
+            r13: r13_value,
+            rcx: expose_mask,
+            r14: message_regs[0],
+            r15: message_regs[1],
+            rbx: message_regs[2],
+            rdi: message_regs[3],
+            rsi: message_regs[4],
+            r8: message_regs[5],
+            r9: message_regs[6],
+            rdx: message_regs[7],
+            ..Default::default()
+        };
+
+        let _ = td_vmcall(&mut args);
+        unsafe {
+            core::arch::asm!("pause");
+        }
+    }
+}
+
 pub fn print(args: fmt::Arguments) {
     Serial
         .write_fmt(args)
@@ -329,6 +401,7 @@ pub enum TdVmcallNum {
     GetTdVmcallInfo = 0x10000,
     Mapgpa = 0x10001,
     GetQuote = 0x10002,
+    ReportFatalError = 0x10003,
     SetupEventNotifyInterrupt = 0x10004,
     Service = 0x10005,
 }
@@ -336,12 +409,19 @@ pub enum TdVmcallNum {
 #[repr(C)]
 #[derive(Default)]
 pub(crate) struct TdVmcallArgs {
+    r8: u64,
+    r9: u64,
     r10: u64,
     r11: u64,
     r12: u64,
     r13: u64,
     r14: u64,
     r15: u64,
+    rbx: u64,
+    rcx: u64,
+    rdi: u64,
+    rsi: u64,
+    rdx: u64,
 }
 
 const SERIAL_IO_PORT: u16 = 0x3F8;
