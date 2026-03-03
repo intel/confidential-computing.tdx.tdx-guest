@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
-// Copyright(c) 2023-2024 Intel Corporation.
+// Copyright(c) 2023-2026 Intel Corporation.
 
 #![cfg_attr(not(test), no_std)]
 #![allow(dead_code)]
@@ -10,36 +10,45 @@ extern crate alloc;
 mod asm;
 pub mod tdcall;
 pub mod tdvmcall;
+pub mod unaccepted_memory;
 mod ve;
 
-use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use core::sync::atomic::{
+    AtomicBool, AtomicU64, AtomicU8,
+    Ordering::{Acquire, Relaxed, Release},
+};
 
 use bitflags::bitflags;
 use raw_cpuid::{native_cpuid::cpuid_count, CpuIdResult};
-use tdcall::{InitError, TdgVpInfo};
+use tdcall::{InitError, TdCallError, TdgVpInfo};
 use ve::{handle_io, handle_mmio};
 
 pub use self::{
-    tdcall::{get_veinfo, TdgVeInfo, TdxVirtualExceptionType},
+    tdcall::{accept_page, get_veinfo, TdgVeInfo, TdxVirtualExceptionType},
     tdvmcall::{cpuid, hlt, print, rdmsr, wrmsr, TDX_LOGGER},
 };
 
 #[derive(Debug)]
 pub enum TopologyError {
-    TdCall(tdcall::TdCallError),
+    TdCall(TdCallError),
     NotConfigured,
 }
 
 #[derive(Debug)]
 pub enum SeptVeError {
-    TdCall(tdcall::TdCallError),
+    TdCall(TdCallError),
     Misconfiguration,
+}
+
+#[derive(Debug)]
+pub enum AcceptError {
+    TdCall(TdCallError),
+    InvalidAlignment,
 }
 
 pub type TdxGpa = usize;
 
-pub const SHARED_BIT: u8 = 51;
-pub const SHARED_MASK: u64 = 1u64 << SHARED_BIT;
+pub static SHARED_MASK: AtomicU64 = AtomicU64::new(0);
 
 pub trait TdxTrapFrame {
     fn rax(&self) -> usize;
@@ -81,10 +90,49 @@ pub fn tdx_is_enabled() -> bool {
     TDX_ENABLED.load(Relaxed)
 }
 
+/// Returns true if the system is identified as an Intel TDX guest during early boot.
+///
+/// This function is designed for use in environments like the EFI stub where
+/// complex initialization is not yet possible. It uses an internal atomic cache
+/// to ensure that the hardware CPUID check is performed only once.
+pub fn is_tdx_guest_early() -> bool {
+    match TdxEarlyState::from(TDX_EARLY_STATE.load(Acquire)) {
+        TdxEarlyState::Enabled => true,
+        TdxEarlyState::Disabled => false,
+        _ => {
+            let is_tdx = is_tdx_hardware_present();
+            let new_state = if is_tdx {
+                TdxEarlyState::Enabled
+            } else {
+                TdxEarlyState::Disabled
+            };
+
+            TDX_EARLY_STATE.store(new_state as u8, Release);
+            is_tdx
+        }
+    }
+}
+
+/// Performs full initialization of the Intel TDX guest environment.
+///
+/// This function validates the TDX hardware signature, invokes the `TDG.VP.INFO`
+/// TDCALL to retrieve Trust Domain environment information, and configures global
+/// state such as the shared memory mask.
 pub fn init_tdx() -> Result<TdgVpInfo, InitError> {
+    if tdx_is_enabled() {
+        return tdcall::get_tdinfo().map_err(InitError::TdxGetVpInfoError);
+    }
+
     check_tdx_guest()?;
-    let info = tdcall::get_tdinfo()?;
+
+    let info = tdcall::get_tdinfo().map_err(InitError::TdxGetVpInfoError)?;
+
+    let gpaw: u64 = info.gpaw.into();
+    let mask = 1u64 << (gpaw - 1);
+    SHARED_MASK.store(mask, Relaxed);
+
     TDX_ENABLED.store(true, Relaxed);
+
     Ok(info)
 }
 
@@ -145,6 +193,57 @@ pub fn reduce_unnecessary_ve() -> Result<(), TopologyError> {
     }
 
     enable_cpu_topology_enumeration()
+}
+
+/// Accepts a range of physical memory to be used as TDX private memory.
+///
+/// # Safety
+///
+/// The caller must ensure the following invariants are met:
+/// - **Address Validity**: The GPA range `[gpa_start, gpa_end)` must represent a valid range.
+/// - **State Invariant**: The target memory pages must be in the `Pending` state.
+///   Accepting pages that are already `Accepted` or in an uninitialized state will
+///   result in a TDX instruction error.
+/// - **Exclusive Access**: The caller must ensure no other CPU context is
+///   simultaneously attempting to accept or access this specific GPA range to
+///   prevent race conditions in the TDX Module's metadata.
+/// - **Alignment**: While the function checks basic 4K alignment, the caller must ensure
+///   the range corresponds to actual physical backing store provided by the VMM.
+pub unsafe fn accept_memory(gpa_start: u64, gpa_end: u64) -> Result<(), AcceptError> {
+    if gpa_start >= gpa_end {
+        return Ok(());
+    }
+
+    if (gpa_start & (PageLevel::L1_4K.bytes() - 1)) != 0 {
+        return Err(AcceptError::InvalidAlignment);
+    }
+
+    let mut current_addr = gpa_start;
+
+    while current_addr < gpa_end {
+        let len = gpa_end - current_addr;
+        let mut accepted = false;
+
+        for &level in &PageLevel::PRIORITIES {
+            match try_accept_one(current_addr, len, level)? {
+                TryAcceptResult::Accepted(size) => {
+                    current_addr += size;
+                    accepted = true;
+                    break;
+                }
+                TryAcceptResult::SizeMismatch | TryAcceptResult::SkipLevel => {
+                    // Try next (smaller) page level
+                    continue;
+                }
+            }
+        }
+
+        if !accepted {
+            // Fails if even L1_4K cannot be accepted
+            return Err(AcceptError::InvalidAlignment);
+        }
+    }
+    Ok(())
 }
 
 pub fn enable_cpu_topology_enumeration() -> Result<(), TopologyError> {
@@ -276,26 +375,94 @@ pub mod metadata {
     }
 }
 
-static TDX_ENABLED: AtomicBool = AtomicBool::new(false);
-
 pub(crate) fn is_protected_gpa(gpa: TdxGpa) -> bool {
-    (gpa as u64 & SHARED_MASK) == 0
+    let mask = SHARED_MASK.load(Relaxed);
+    let gpa_u64 = u64::try_from(gpa).expect("TdxGpa must fit into u64 on x86_64");
+    (gpa_u64 & mask) == 0
 }
 
 fn check_tdx_guest() -> Result<(), InitError> {
-    const TDX_CPUID_LEAF_ID: u64 = 0x21;
-    let cpuid_leaf = cpuid_count(0, 0).eax as u64;
-    if cpuid_leaf < TDX_CPUID_LEAF_ID {
-        return Err(InitError::TdxCpuLeafIdError);
+    let max_leaf = cpuid_count(0, 0).eax;
+    if max_leaf < TDX_CPUID_LEAF_ID {
+        return Err(InitError::TdxCpuLeafIdTooLow);
     }
-    let cpuid_result: CpuIdResult = cpuid_count(TDX_CPUID_LEAF_ID as u32, 0);
-    if &cpuid_result.ebx.to_ne_bytes() != b"Inte"
-        || &cpuid_result.edx.to_ne_bytes() != b"lTDX"
-        || &cpuid_result.ecx.to_ne_bytes() != b"    "
-    {
-        return Err(InitError::TdxVendorIdError);
+    if !is_tdx_hardware_present() {
+        return Err(InitError::TdxVendorIdMismatch);
     }
+
     Ok(())
+}
+
+fn is_tdx_hardware_present() -> bool {
+    let res: CpuIdResult = cpuid_count(TDX_CPUID_LEAF_ID, 0);
+
+    let mut sig = [0u8; 12];
+    sig[0..4].copy_from_slice(&res.ebx.to_le_bytes());
+    sig[4..8].copy_from_slice(&res.edx.to_le_bytes());
+    sig[8..12].copy_from_slice(&res.ecx.to_le_bytes());
+
+    &sig == TDX_IDENT
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(u8)]
+enum TdxEarlyState {
+    Uninitialized = 0,
+    Enabled = 1,
+    Disabled = 2,
+}
+
+impl TdxEarlyState {
+    const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Enabled,
+            2 => Self::Disabled,
+            _ => Self::Uninitialized,
+        }
+    }
+}
+
+impl From<u8> for TdxEarlyState {
+    fn from(value: u8) -> Self {
+        Self::from_u8(value)
+    }
+}
+
+static TDX_EARLY_STATE: AtomicU8 = AtomicU8::new(TdxEarlyState::Uninitialized as u8);
+static TDX_ENABLED: AtomicBool = AtomicBool::new(false);
+
+const TDX_IDENT: &[u8; 12] = b"IntelTDX    ";
+const TDX_CPUID_LEAF_ID: u32 = 0x21;
+
+/// Attempts to accept a single memory page at the specified level.
+fn try_accept_one(
+    start: u64,
+    len: u64,
+    page_level: PageLevel,
+) -> Result<TryAcceptResult, AcceptError> {
+    let size = page_level.bytes();
+
+    if (start & (size - 1)) != 0 || len < size {
+        return Ok(TryAcceptResult::SkipLevel);
+    }
+
+    match unsafe { accept_page(page_level as u64, start) } {
+        Ok(_) => Ok(TryAcceptResult::Accepted(size)),
+        Err(e) => match e {
+            // PageSizeMismatch: VMM mapped it differently.
+            // OperandInvalid: Hardware doesn't support this size or address is rejected.
+            TdCallError::TdxPageSizeMismatch | TdCallError::TdxOperandInvalid => {
+                if page_level == PageLevel::L1_4K {
+                    // If the minimum architectural unit is rejected, it's a fatal error.
+                    Err(AcceptError::TdCall(e))
+                } else {
+                    // Fall back to a smaller page size.
+                    Ok(TryAcceptResult::SizeMismatch)
+                }
+            }
+            _ => Err(AcceptError::TdCall(e)),
+        },
+    }
 }
 
 bitflags! {
@@ -318,14 +485,46 @@ bitflags! {
     }
 }
 
-impl From<tdcall::TdCallError> for TopologyError {
-    fn from(err: tdcall::TdCallError) -> Self {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum PageLevel {
+    L1_4K = 0,
+    L2_2M = 1,
+    L3_1G = 2,
+}
+
+impl PageLevel {
+    pub const PRIORITIES: [Self; 3] = [Self::L3_1G, Self::L2_2M, Self::L1_4K];
+
+    pub const fn bytes(self) -> u64 {
+        1 << (12 + (self as u32) * 9)
+    }
+}
+
+/// Represents the result of a single page acceptance attempt.
+enum TryAcceptResult {
+    /// Successfully accepted a page of the given size.
+    Accepted(u64),
+    /// Current address or length is not aligned/sufficient for this level.
+    SkipLevel,
+    /// Hardware/VMM reports a size mismatch or lack of support for this level.
+    SizeMismatch,
+}
+
+impl From<TdCallError> for TopologyError {
+    fn from(err: TdCallError) -> Self {
         TopologyError::TdCall(err)
     }
 }
 
-impl From<tdcall::TdCallError> for SeptVeError {
-    fn from(err: tdcall::TdCallError) -> Self {
+impl From<TdCallError> for SeptVeError {
+    fn from(err: TdCallError) -> Self {
         SeptVeError::TdCall(err)
+    }
+}
+
+impl From<TdCallError> for AcceptError {
+    fn from(err: TdCallError) -> Self {
+        AcceptError::TdCall(err)
     }
 }

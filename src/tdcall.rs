@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
-// Copyright(c) 2023-2024 Intel Corporation.
+// Copyright(c) 2023-2026 Intel Corporation.
 
 //! The TDCALL instruction causes a VM exit to the Intel TDX module.
 //!
@@ -59,8 +59,8 @@ pub enum TdCallError {
 
 #[derive(Debug)]
 pub enum InitError {
-    TdxVendorIdError,
-    TdxCpuLeafIdError,
+    TdxVendorIdMismatch,
+    TdxCpuLeafIdTooLow,
     TdxGetVpInfoError(TdCallError),
 }
 
@@ -745,7 +745,7 @@ pub struct TdInfo {
     pub reserved: [u8; 64],
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Gpaw {
     Bit48,
     Bit52,
