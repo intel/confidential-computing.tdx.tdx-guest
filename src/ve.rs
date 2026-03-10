@@ -33,7 +33,7 @@ pub(crate) fn handle_io(trapframe: &mut dyn TdxTrapFrame, ve_info: &TdgVeInfo) -
     } else {
         Direction::In
     };
-    let operand = if (ve_info.exit_qualification >> 6) & 0x1 == 0 {
+    let _operand = if (ve_info.exit_qualification >> 6) & 0x1 == 0 {
         Operand::Dx
     } else {
         Operand::Immediate

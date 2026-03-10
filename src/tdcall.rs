@@ -495,7 +495,7 @@ pub fn enter_l2_vcpu(
     let rcx = (l2_vm_idx << 52) | (invd_translations as u64);
     let mut args = TdcallArgs {
         rax: TdcallNum::VpEnter as u64,
-        rcx: l2_vm_idx,
+        rcx,
         rdx: guest_state_gpa,
         ..Default::default()
     };
@@ -510,7 +510,7 @@ pub fn enter_l2_vcpu(
 ///   Bit 2: Invalidate EPT for L2 VM #2.
 ///   Bit 3: Invalidate EPT for L2 VM #3.
 pub fn invalidate_l2_cached_ept(l2_vm_idx_bitmap: u64) -> Result<(), TdCallError> {
-    if l2_vm_idx_bitmap & !0b1110 == 0 {
+    if l2_vm_idx_bitmap == 0 || (l2_vm_idx_bitmap & !0b1110u64) != 0 {
         return Err(TdCallError::TdxOperandInvalid);
     }
     let mut args = TdcallArgs {

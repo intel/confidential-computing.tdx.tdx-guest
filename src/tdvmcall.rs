@@ -247,7 +247,7 @@ pub fn setup_event_notify_interrupt(interrupt_vector: u64) -> Result<(), TdVmcal
 
 /// GetTdVmCallInfo TDG.VP.VMCALL is used to help request the host VMM enumerate which
 /// TDG.VP.VMCALLs are supported.
-pub fn get_tdvmcall_info(interrupt_vector: u64) -> Result<(), TdVmcallError> {
+pub fn get_tdvmcall_info(_interrupt_vector: u64) -> Result<(), TdVmcallError> {
     let mut args = TdVmcallArgs {
         r11: TdVmcallNum::GetTdVmcallInfo as u64,
         // This register is reserved to extend TDG.VP.VMCALL enumeration in future versions.
@@ -478,7 +478,7 @@ impl From<u64> for TdVmcallError {
 }
 
 impl Log for TdxLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
+    fn enabled(&self, _metadata: &Metadata) -> bool {
         true
     }
 
