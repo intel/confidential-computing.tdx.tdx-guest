@@ -42,7 +42,15 @@ pub(crate) fn handle_io(trapframe: &mut dyn TdxTrapFrame, ve_info: &TdgVeInfo) -
 
     match direction {
         Direction::In => {
-            trapframe.set_rax(io_read(size, port).unwrap() as usize);
+            let value = io_read(size, port).unwrap() as usize;
+            match size {
+                IoSize::Size1 => trapframe.set_rax((trapframe.rax() & !0xFF) | (value & 0xFF)),
+                IoSize::Size2 => {
+                    trapframe.set_rax((trapframe.rax() & !0xFFFF) | (value & 0xFFFF))
+                }
+                IoSize::Size4 => trapframe.set_rax(value & 0xFFFF_FFFF),
+                _ => unreachable!(),
+            }
         }
         Direction::Out => {
             io_write(size, port, trapframe.rax() as u32).unwrap();
@@ -145,9 +153,9 @@ pub(crate) fn handle_mmio(
                 InstrMmioType::Read =>
                 // Safety: The mmio_gpa obtained from `ve_info` is valid, and the size parsed from the instruction is valid.
                 unsafe {
-                    let read_res = read_mmio(size, ve_info.guest_physical_address)
+                    let read_res = (read_mmio(size, ve_info.guest_physical_address)
                         .map_err(MmioError::TdVmcallError)?
-                        as usize;
+                        & mmio_read_mask(size)) as usize;
                     // serial_println!("instr.op0_register: {:?}", instr.op0_register());
                     match instr.op0_register() {
                         Register::RAX => trapframe.set_rax(read_res),
@@ -276,9 +284,9 @@ pub(crate) fn handle_mmio(
                 InstrMmioType::ReadZeroExtend =>
                 // Safety: The mmio_gpa obtained from `ve_info` is valid, and the size parsed from the instruction is valid.
                 unsafe {
-                    let read_res = read_mmio(size, ve_info.guest_physical_address)
+                    let read_res = (read_mmio(size, ve_info.guest_physical_address)
                         .map_err(MmioError::TdVmcallError)?
-                        as usize;
+                        & mmio_read_mask(size)) as usize;
                     match instr.op0_register() {
                         Register::RAX | Register::EAX | Register::AX | Register::AL => {
                             trapframe.set_rax(read_res)
@@ -405,6 +413,15 @@ fn decode_mmio(instr: &Instruction) -> Option<(InstrMmioType, IoSize)> {
             Some((InstrMmioType::ReadSignExtend, IoSize::Size2))
         }
         _ => None,
+    }
+}
+
+fn mmio_read_mask(size: IoSize) -> u64 {
+    match size {
+        IoSize::Size1 => 0xFF,
+        IoSize::Size2 => 0xFFFF,
+        IoSize::Size4 => 0xFFFF_FFFF,
+        IoSize::Size8 => u64::MAX,
     }
 }
 

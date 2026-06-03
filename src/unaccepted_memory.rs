@@ -39,7 +39,7 @@ pub const EFI_UNACCEPTED_UNIT_SIZE: u64 = 2 * 1024 * 1024;
 /// This type does not provide internal synchronization for bitmap mutation.
 /// Callers must serialize mutating operations (for example with a spinlock)
 /// before invoking methods like `register_range` or `accept_range`.
-#[derive(Copy, Clone, Debug)]
+#[derive(Debug)]
 #[repr(C, packed)]
 pub struct EfiUnacceptedMemory {
     /// The version of the table. Currently, only version 1 is defined.
@@ -94,16 +94,31 @@ impl EfiUnacceptedMemory {
     }
 
     /// Returns whether `(start, size)` overlaps any pending bitmap unit.
-    pub fn is_range_pending_by_size(&self, start: u64, size: u64) -> Result<bool, AcceptError> {
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure this header is followed in memory by at least
+    /// `self.bitmap_size_bytes` readable bitmap bytes.
+    pub unsafe fn is_range_pending_by_size(
+        &self,
+        start: u64,
+        size: u64,
+    ) -> Result<bool, AcceptError> {
         let Some(end) = start.checked_add(size) else {
             return Err(AcceptError::ArithmeticOverflow);
         };
 
-        self.is_range_pending(start, end)
+        // SAFETY: Caller guarantees the table header is followed by readable bitmap bytes.
+        unsafe { self.is_range_pending(start, end) }
     }
 
     /// Returns whether `[start, end)` overlaps any pending bitmap unit.
-    pub fn is_range_pending(&self, start: u64, end: u64) -> Result<bool, AcceptError> {
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure this header is followed in memory by at least
+    /// `self.bitmap_size_bytes` readable bitmap bytes.
+    pub unsafe fn is_range_pending(&self, start: u64, end: u64) -> Result<bool, AcceptError> {
         let Some((range_start, range_end, unit_size)) =
             self.clamp_gpa_range_to_bitmap_coverage(start, end)?
         else {
@@ -111,7 +126,7 @@ impl EfiUnacceptedMemory {
         };
 
         let (first_bit, last_bit) = self.addr_to_bit_range(range_start, range_end, unit_size)?;
-        // SAFETY: caller of this safe API only reads immutable table state.
+        // SAFETY: Caller guarantees the table header is followed by readable bitmap bytes.
         let bitmap = unsafe { self.as_bitmap_slice() };
         BitmapRef::new(bitmap).has_set_bit(first_bit, last_bit)
     }
@@ -120,8 +135,14 @@ impl EfiUnacceptedMemory {
     ///
     /// Ranges outside bitmap coverage are considered accepted by definition,
     /// because this table only tracks deferred acceptance inside its own coverage.
-    pub fn is_fully_accepted(&self, start: u64, end: u64) -> Result<bool, AcceptError> {
-        Ok(!self.is_range_pending(start, end)?)
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure this header is followed in memory by at least
+    /// `self.bitmap_size_bytes` readable bitmap bytes.
+    pub unsafe fn is_fully_accepted(&self, start: u64, end: u64) -> Result<bool, AcceptError> {
+        // SAFETY: Caller guarantees the table header is followed by readable bitmap bytes.
+        Ok(!unsafe { self.is_range_pending(start, end) }?)
     }
 
     /// Convenience wrapper for
