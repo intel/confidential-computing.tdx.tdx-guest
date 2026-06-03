@@ -142,12 +142,12 @@ pub fn handle_virtual_exception(trapframe: &mut dyn TdxTrapFrame, ve_info: &TdgV
     let mut instr_len = ve_info.exit_instruction_length;
     match ve_info.exit_reason.into() {
         TdxVirtualExceptionType::Hlt => {
-            hlt();
+            panic_halt();
         }
         TdxVirtualExceptionType::Io => {
             if !handle_io(trapframe, ve_info) {
                 serial_println!("Handle tdx ioexit errors, ready to halt");
-                hlt();
+                panic_halt();
             }
         }
         TdxVirtualExceptionType::MsrRead => {
@@ -161,22 +161,21 @@ pub fn handle_virtual_exception(trapframe: &mut dyn TdxTrapFrame, ve_info: &TdgV
         }
         TdxVirtualExceptionType::CpuId => {
             let cpuid_info = cpuid(trapframe.rax() as u32, trapframe.rcx() as u32).unwrap();
-            let mask = 0xFFFF_FFFF_0000_0000_usize;
-            trapframe.set_rax((trapframe.rax() & mask) | cpuid_info.eax);
-            trapframe.set_rbx((trapframe.rbx() & mask) | cpuid_info.ebx);
-            trapframe.set_rcx((trapframe.rcx() & mask) | cpuid_info.ecx);
-            trapframe.set_rdx((trapframe.rdx() & mask) | cpuid_info.edx);
+            trapframe.set_rax(cpuid_info.eax);
+            trapframe.set_rbx(cpuid_info.ebx);
+            trapframe.set_rcx(cpuid_info.ecx);
+            trapframe.set_rdx(cpuid_info.edx);
         }
         TdxVirtualExceptionType::EptViolation => {
             if is_protected_gpa(ve_info.guest_physical_address as TdxGpa) {
                 serial_println!("Unexpected EPT-violation on private memory");
-                hlt();
+                panic_halt();
             }
             instr_len = handle_mmio(trapframe, ve_info).unwrap() as u32;
         }
         TdxVirtualExceptionType::Other => {
             serial_println!("Unknown TDX virtual exception type");
-            hlt();
+            panic_halt();
         }
         _ => return,
     }
@@ -404,6 +403,12 @@ fn is_tdx_hardware_present() -> bool {
     sig[8..12].copy_from_slice(&res.ecx.to_le_bytes());
 
     &sig == TDX_IDENT
+}
+
+fn panic_halt() -> ! {
+    loop {
+        hlt();
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

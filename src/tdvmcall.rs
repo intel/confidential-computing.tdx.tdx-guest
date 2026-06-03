@@ -43,6 +43,7 @@ pub struct CpuIdInfo {
     pub edx: usize,
 }
 
+#[derive(Clone, Copy)]
 pub enum IoSize {
     Size1 = 1,
     Size2 = 2,
@@ -69,10 +70,10 @@ pub fn cpuid(eax: u32, ecx: u32) -> Result<CpuIdInfo, TdVmcallError> {
     };
     td_vmcall(&mut args)?;
     Ok(CpuIdInfo {
-        eax: args.r12 as usize,
-        ebx: args.r13 as usize,
-        ecx: args.r14 as usize,
-        edx: args.r15 as usize,
+        eax: (args.r12 as u32) as usize,
+        ebx: (args.r13 as u32) as usize,
+        ecx: (args.r14 as u32) as usize,
+        edx: (args.r15 as u32) as usize,
     })
 }
 
