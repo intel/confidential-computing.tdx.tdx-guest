@@ -142,12 +142,12 @@ pub fn handle_virtual_exception(trapframe: &mut dyn TdxTrapFrame, ve_info: &TdgV
     let mut instr_len = ve_info.exit_instruction_length;
     match ve_info.exit_reason.into() {
         TdxVirtualExceptionType::Hlt => {
-            panic_halt();
+            hlt();
         }
         TdxVirtualExceptionType::Io => {
             if !handle_io(trapframe, ve_info) {
                 serial_println!("Handle tdx ioexit errors, ready to halt");
-                panic_halt();
+                halt_forever();
             }
         }
         TdxVirtualExceptionType::MsrRead => {
@@ -169,13 +169,13 @@ pub fn handle_virtual_exception(trapframe: &mut dyn TdxTrapFrame, ve_info: &TdgV
         TdxVirtualExceptionType::EptViolation => {
             if is_protected_gpa(ve_info.guest_physical_address as TdxGpa) {
                 serial_println!("Unexpected EPT-violation on private memory");
-                panic_halt();
+                halt_forever();
             }
             instr_len = handle_mmio(trapframe, ve_info).unwrap() as u32;
         }
         TdxVirtualExceptionType::Other => {
             serial_println!("Unknown TDX virtual exception type");
-            panic_halt();
+            halt_forever();
         }
         _ => return,
     }
@@ -405,7 +405,7 @@ fn is_tdx_hardware_present() -> bool {
     &sig == TDX_IDENT
 }
 
-fn panic_halt() -> ! {
+fn halt_forever() -> ! {
     loop {
         hlt();
     }
