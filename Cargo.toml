@@ -1,6 +1,6 @@
 [package]
 name = "tdx-guest"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "The tdx-guest provides a Rust implementation of Intel® Trust Domain Extensions (Intel® TDX) Guest APIs, supporting for TDX Guest specific instructions, structures and functions."
 license = "BSD-3-Clause"
@@ -10,7 +10,7 @@ authors = ["Hsy-Intel <siyuan.hui@intel.com>", "Edmund Song <edmund.song@intel.c
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-x86_64 = "~0.15.4"
+x86_64 = "~0.15.5"
 bitflags = "1.3"
 raw-cpuid = "10"
 uefi-raw = "0.8.0"
