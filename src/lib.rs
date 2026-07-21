@@ -50,7 +50,11 @@ pub enum AcceptError {
 
 pub type TdxGpa = usize;
 
-pub static SHARED_MASK: AtomicU64 = AtomicU64::new(0);
+static SHARED_MASK: AtomicU64 = AtomicU64::new(0);
+
+pub fn shared_mask() -> u64 {
+    SHARED_MASK.load(Relaxed)
+}
 
 pub trait TdxTrapFrame {
     fn rax(&self) -> usize;
