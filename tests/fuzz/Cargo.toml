@@ -9,7 +9,6 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-tdx-guest = { path = "../.." }
 
 [[bin]]
 name = "bitmap_ranges"

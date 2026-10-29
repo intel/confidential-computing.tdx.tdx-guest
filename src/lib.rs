@@ -25,6 +25,10 @@ use ve::{handle_io, handle_mmio};
 pub use self::{
     tdcall::{accept_page, get_veinfo, TdgVeInfo, TdxVirtualExceptionType},
     tdvmcall::{cpuid, hlt, print, rdmsr, wrmsr, TDX_LOGGER},
+    unaccepted_memory::{
+        ensure_accepted, init_acceptance_state, unaccepted_bytes, unaccepted_memory_table,
+        EfiUnacceptedMemory, EfiUnacceptedMemoryBuilder,
+    },
 };
 
 #[derive(Debug)]
