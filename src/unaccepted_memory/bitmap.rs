@@ -2,38 +2,31 @@
 // Copyright(c) 2026 Intel Corporation.
 
 //! Bitmap data structures for tracking unaccepted memory.
-//!
-//! This module provides [`BitmapRef`], a view backed by a slice of atomic 64-bit
-//! words (`&'a [AtomicU64]`).
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::{
+    ops::Range,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
-pub type BitIndex = u64;
+pub(super) type BitIndex = u64;
 
 /// Bitmap view backed by a slice of [`AtomicU64`].
 ///
-/// Supports lock-free queries (`has_set_bit`, `find_next_set`, etc.) as well
-/// as atomic range updates (`set_range`, `clear_range`, `clear_all`) via
-/// `AtomicU64`'s relaxed atomic operations.
+/// Supports lock-free queries with acquire semantics and atomic updates with release semantics.
 #[derive(Clone, Copy)]
-pub struct BitmapRef<'a> {
+pub(super) struct BitmapRef<'a> {
     bits: &'a [AtomicU64],
 }
 
 impl<'a> BitmapRef<'a> {
-    /// Creates a bitmap view from a slice of atomic 64-bit words.
-    pub const fn new(bits: &'a [AtomicU64]) -> Self {
-        Self { bits }
-    }
-
     /// Creates a bitmap view from a `u64`-aligned raw pointer.
     ///
     /// # Safety
     ///
-    /// - `ptr` must be non-null and aligned to `align_of::<AtomicU64>()`.
-    /// - `ptr` must point to at least `len_bytes` bytes of valid memory.
-    /// - `len_bytes` must be a multiple of `size_of::<AtomicU64>()`.
-    /// - The memory must remain valid for lifetime `'a`.
+    /// - `ptr` must be valid for reads and writes of `len_bytes` initialized
+    ///   bytes, aligned to `align_of::<AtomicU64>()`, for lifetime `'a`.
+    /// - The memory must not be accessed through any mutable reference or
+    ///   non-atomic operation during `'a`.
     pub(super) unsafe fn from_raw(ptr: *const u8, len_bytes: usize) -> Self {
         debug_assert_eq!(len_bytes % core::mem::size_of::<AtomicU64>(), 0);
         let len_words = len_bytes / core::mem::size_of::<AtomicU64>();
@@ -42,150 +35,71 @@ impl<'a> BitmapRef<'a> {
         Self { bits }
     }
 
-    /// Returns the underlying atomic words.
-    pub const fn words(&self) -> &'a [AtomicU64] {
-        self.bits
-    }
-
     /// Returns the total capacity in bits.
-    pub const fn capacity(&self) -> u64 {
+    pub(super) const fn capacity(&self) -> u64 {
         (self.bits.len() as u64) * 64
     }
 
-    /// Returns `true` if any bit in `[start_bit, end_bit)` is set.
-    pub fn has_set_bit(&self, start_bit: BitIndex, end_bit: BitIndex) -> bool {
-        let total_bits = self.capacity();
-        if start_bit >= end_bit || start_bit >= total_bits {
-            return false;
-        }
-        let end_bit = end_bit.min(total_bits);
-
-        let start = start_bit as usize;
-        let end = end_bit as usize;
-
-        let start_word = start / 64;
-        let end_word = (end - 1) / 64;
-
-        for word_idx in start_word..=end_word {
-            let word_bit_start = word_idx * 64;
-            let lo = start.saturating_sub(word_bit_start);
-            let hi = end.min(word_bit_start + 64) - word_bit_start;
-            let mask = word_range_mask(lo, hi);
-            if self.bits[word_idx].load(Ordering::Relaxed) & mask != 0 {
-                return true;
-            }
-        }
-
-        false
+    /// Returns `true` if `bit` is within capacity and set (`1`), using acquire ordering.
+    pub(super) fn is_bit_set(&self, bit: BitIndex) -> bool {
+        self.bit_word_and_mask(bit)
+            .is_some_and(|(word, mask)| word.load(Ordering::Acquire) & mask != 0)
     }
 
-    /// Returns the total number of set bits (count of ones) across the bitmap.
-    pub fn pending_unit_count(&self) -> u64 {
+    /// Clears `bit` to `0` using release ordering and returns `true` if it was previously set.
+    pub(super) fn clear_bit(&self, bit: BitIndex) -> bool {
+        self.bit_word_and_mask(bit)
+            .is_some_and(|(word, mask)| word.fetch_and(!mask, Ordering::Release) & mask != 0)
+    }
+
+    /// Returns the total number of set bits (`1`s) across the bitmap.
+    pub(super) fn count_ones(&self) -> u64 {
         self.bits
             .iter()
-            .map(|word| word.load(Ordering::Relaxed).count_ones() as u64)
+            .map(|word| word.load(Ordering::Acquire).count_ones() as u64)
             .sum()
     }
 
-    /// Clears all bits in the bitmap.
-    pub fn clear_all(&self) {
-        for word in self.bits {
-            word.store(0, Ordering::Relaxed);
-        }
-    }
-
-    /// Finds the first set bit (1) in `[start_bit, end_bit)`.
-    pub fn find_next_set(&self, start_bit: BitIndex, end_bit: BitIndex) -> Option<BitIndex> {
-        self.find_next_matching(start_bit, end_bit, true)
-    }
-
-    /// Finds the first cleared bit (0) in `[start_bit, end_bit)`.
-    pub fn find_next_zero(&self, start_bit: BitIndex, end_bit: BitIndex) -> Option<BitIndex> {
-        self.find_next_matching(start_bit, end_bit, false)
-    }
-
-    /// Sets all bits in `[start_bit, end_bit)` to `1`.
-    pub fn set_range(&self, start_bit: BitIndex, end_bit: BitIndex) {
-        self.update_range(start_bit, end_bit, true);
-    }
-
-    /// Clears all bits in `[start_bit, end_bit)` to `0`.
-    pub fn clear_range(&self, start_bit: BitIndex, end_bit: BitIndex) {
-        self.update_range(start_bit, end_bit, false);
-    }
-
-    fn find_next_matching(
-        &self,
-        start_bit: BitIndex,
-        end_bit: BitIndex,
-        target: bool,
-    ) -> Option<BitIndex> {
-        let total_bits = self.capacity();
-        if start_bit >= end_bit || start_bit >= total_bits {
-            return None;
-        }
-        let end_bit = end_bit.min(total_bits);
-
-        let start = start_bit as usize;
-        let end = end_bit as usize;
-
-        let start_word = start / 64;
-        let end_word = (end - 1) / 64;
-
-        for word_idx in start_word..=end_word {
-            let word_bit_start = word_idx * 64;
-            let lo = start.saturating_sub(word_bit_start);
-            let hi = end.min(word_bit_start + 64) - word_bit_start;
-            let mask = word_range_mask(lo, hi);
-
-            let word = self.bits[word_idx].load(Ordering::Relaxed);
-            let match_bits = (if target { word } else { !word }) & mask;
+    /// Finds the first set bit (`1`) in `range`.
+    pub(super) fn find_next_set(&self, range: Range<BitIndex>) -> Option<BitIndex> {
+        for (word_idx, mask) in self.word_masks(range) {
+            let match_bits = self.bits[word_idx].load(Ordering::Acquire) & mask;
             if match_bits != 0 {
-                let delta = match_bits.trailing_zeros() as usize;
-                let found = (word_bit_start + delta) as u64;
-                return Some(found);
+                return Some((word_idx * 64 + match_bits.trailing_zeros() as usize) as u64);
             }
         }
 
         None
     }
 
-    fn update_range(&self, start_bit: BitIndex, end_bit: BitIndex, set_bits: bool) {
-        let total_bits = self.capacity();
-        if start_bit >= end_bit || start_bit >= total_bits {
-            return;
+    /// Sets all bits in `range` to `1`.
+    pub(super) fn set_range(&self, range: Range<BitIndex>) {
+        for (word_idx, mask) in self.word_masks(range) {
+            self.bits[word_idx].fetch_or(mask, Ordering::Release);
         }
-        let end_bit = end_bit.min(total_bits);
+    }
 
-        let start = start_bit as usize;
-        let end = end_bit as usize;
+    fn bit_word_and_mask(&self, bit: BitIndex) -> Option<(&AtomicU64, u64)> {
+        let word_idx = usize::try_from(bit / 64).ok()?;
+        let word = self.bits.get(word_idx)?;
+        Some((word, 1u64 << (bit % 64)))
+    }
 
-        let start_word = start / 64;
-        let end_word = (end - 1) / 64;
+    fn word_masks(&self, range: Range<BitIndex>) -> impl Iterator<Item = (usize, u64)> {
+        let end = range.end.min(self.capacity()) as usize;
+        let start = (range.start as usize).min(end);
+        let word_range = if start < end {
+            (start / 64)..end.div_ceil(64)
+        } else {
+            0..0
+        };
 
-        for word_idx in start_word..=end_word {
+        word_range.map(move |word_idx| {
             let word_bit_start = word_idx * 64;
             let lo = start.saturating_sub(word_bit_start);
             let hi = end.min(word_bit_start + 64) - word_bit_start;
-            let mask = word_range_mask(lo, hi);
-
-            if set_bits {
-                self.bits[word_idx].fetch_or(mask, Ordering::Relaxed);
-            } else {
-                self.bits[word_idx].fetch_and(!mask, Ordering::Relaxed);
-            }
-        }
-    }
-}
-
-/// Returns a 64-bit mask with bits in `[lo, hi)` set to `1` and all other bits cleared.
-fn word_range_mask(lo: usize, hi: usize) -> u64 {
-    debug_assert!(lo <= hi && hi <= 64);
-    if lo >= hi {
-        0
-    } else {
-        let mask_hi = if hi == 64 { !0u64 } else { (1u64 << hi) - 1 };
-        let mask_lo = (1u64 << lo) - 1;
-        mask_hi & !mask_lo
+            let mask = (!0u64 >> (64 - (hi - lo))) << lo;
+            (word_idx, mask)
+        })
     }
 }

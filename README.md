@@ -62,3 +62,15 @@ The tdx-guest provides a Rust implementation of Intel® Trust Domain Extension
 | 48                            | #VE.RequestMMIO                    | ✅             | `read_mmio`, `write_mmio`         | 1.0, 1.5    |
 | 54                            | Instruction.WBINVD                 | ✅             | `perform_cache_operation`         | 1.0, 1.5    |
 | 65                            | Instruction.PCONFIG                | ✅             | `pconfig`                                 | 1.0, 1.5    |
+
+## On-demand memory acceptance
+
+The library also supports on-demand acceptance of guest-private memory.
+After registering an unaccepted-memory table, callers use `ensure_accepted()`
+before accessing allocated memory and supply a callback that disables local
+interrupts and returns a guard that restores their previous state when dropped.
+The library handles synchronization and pending-byte accounting.
+
+See the [`unaccepted_memory` module](src/unaccepted_memory/mod.rs) for table
+construction and the [acceptance API documentation](src/unaccepted_memory/accept.rs)
+for initialization, safety requirements, and error semantics.

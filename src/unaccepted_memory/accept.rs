@@ -3,102 +3,121 @@
 
 //! Acceptance-path operations for unaccepted-memory bitmap ranges.
 //!
-//! This file contains range acceptance flows, plus pending-run claim/restore helpers.
+//! This file contains range acceptance flows and synchronized on-demand
+//! acceptance state management.
 
-use super::{bitmap::BitIndex, EfiUnacceptedMemory};
+use core::{
+    ops::Range,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+use spin::{Mutex, Once};
+
+use super::EfiUnacceptedMemory;
 use crate::{accept_memory, AcceptError};
 
-impl EfiUnacceptedMemory {
-    /// Accepts bitmap-marked units that overlap `start..end`, then clears accepted bits.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure this table and bitmap describe pending private-memory units,
-    /// and the target GPA ranges are valid for TDX acceptance.
-    pub unsafe fn accept_range(&self, start: u64, end: u64) -> Result<(), AcceptError> {
-        let Some((first_bit, last_bit, unit_size)) = self.overlapping_bit_range(start, end) else {
+/// Initializes the global unaccepted-memory acceptance state with `table`.
+pub fn init_acceptance_state(table: &'static EfiUnacceptedMemory) {
+    ACCEPTANCE_STATE.call_once(|| AcceptanceState::new(table));
+}
+
+/// Returns a reference to the registered [`EfiUnacceptedMemory`] table, if initialized.
+pub fn unaccepted_memory_table() -> Option<&'static EfiUnacceptedMemory> {
+    ACCEPTANCE_STATE.get().map(|state| state.table)
+}
+
+/// Returns the number of unaccepted memory bytes remaining, or zero if uninitialized.
+pub fn unaccepted_bytes() -> usize {
+    ACCEPTANCE_STATE
+        .get()
+        .map_or(0, AcceptanceState::unaccepted_bytes)
+}
+
+/// Accepts all pending memory units in the registered [`EfiUnacceptedMemory`]
+/// table that overlap `range` (or does nothing if no table is registered).
+///
+/// `disable_local_irq` must disable local interrupts for the lifetime of its
+/// returned guard to prevent interrupt-handler deadlocks.
+///
+/// # Errors
+///
+/// Returns an error if TDX memory acceptance fails for any pending unit.
+///
+/// # Safety
+///
+/// Every pending unit in the registered table overlapping `range` must be unused
+/// guest-private memory (accepting a page zero-initializes it in hardware).
+pub unsafe fn ensure_accepted<G>(
+    range: Range<u64>,
+    disable_local_irq: impl Fn() -> G,
+) -> Result<(), AcceptError> {
+    let Some(state) = ACCEPTANCE_STATE.get() else {
+        return Ok(());
+    };
+
+    state.ensure_accepted_with(range, disable_local_irq, |unit| {
+        // SAFETY: The caller guarantees overlapping pending units are unused
+        // guest-private memory, and the shard lock serializes acceptance of `unit`.
+        unsafe { accept_memory(unit.start, unit.end) }
+    })
+}
+
+pub(super) const SHARD_COUNT: usize = 64;
+
+pub(super) struct AcceptanceState {
+    pub(super) table: &'static EfiUnacceptedMemory,
+    pub(super) shard_locks: [Mutex<()>; SHARD_COUNT],
+    unaccepted_bytes: AtomicUsize,
+}
+
+impl AcceptanceState {
+    pub(super) fn new(table: &'static EfiUnacceptedMemory) -> Self {
+        let total_bytes = table.bitmap_ref().count_ones() * u64::from(table.unit_size_bytes());
+        Self {
+            table,
+            shard_locks: [const { Mutex::new(()) }; SHARD_COUNT],
+            unaccepted_bytes: AtomicUsize::new(total_bytes as usize),
+        }
+    }
+
+    pub(super) fn unaccepted_bytes(&self) -> usize {
+        self.unaccepted_bytes.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn ensure_accepted_with<G>(
+        &self,
+        range: Range<u64>,
+        disable_local_irq: impl Fn() -> G,
+        mut accept_unit: impl FnMut(Range<u64>) -> Result<(), AcceptError>,
+    ) -> Result<(), AcceptError> {
+        let Some(bit_range) = self.table.overlapping_bit_range(range) else {
             return Ok(());
         };
 
-        let phys_base = self.phys_base;
-        let bitmap = self.bitmap_ref();
-        let mut scan = first_bit;
-        while let Some(run_start) = bitmap.find_next_set(scan, last_bit) {
-            let run_end = bitmap
-                .find_next_zero(run_start, last_bit)
-                .unwrap_or(last_bit);
+        let bitmap = self.table.bitmap_ref();
+        let unit_size = self.table.unit_size_bytes() as usize;
+        let mut next_bit = bit_range.start;
+        while let Some(unit_bit) = bitmap.find_next_set(next_bit..bit_range.end) {
+            next_bit = unit_bit + 1;
+            let shard_index = (unit_bit as usize) % SHARD_COUNT;
+            let _irq_guard = disable_local_irq();
+            // Reverse drop order releases the lock before restoring IRQs, even on errors.
+            let _shard_guard = self.shard_locks[shard_index].lock();
 
-            let run_gpa_start = Self::bit_to_gpa(phys_base, run_start, unit_size)?;
-            let run_gpa_end = Self::bit_to_gpa(phys_base, run_end, unit_size)?;
+            if !bitmap.is_bit_set(unit_bit) {
+                continue;
+            }
 
-            // SAFETY: Caller guarantees bitmap/GPA mapping validity for pending private pages.
-            unsafe { accept_memory(run_gpa_start, run_gpa_end)? };
-            bitmap.clear_range(run_start, run_end);
+            accept_unit(self.table.unit_range(unit_bit))?;
 
-            scan = run_end;
+            if bitmap.clear_bit(unit_bit) {
+                self.unaccepted_bytes
+                    .fetch_sub(unit_size, Ordering::Relaxed);
+            }
         }
 
         Ok(())
     }
-
-    /// Finds the first contiguous run of set bits overlapping `[start, end)`,
-    /// clears those bits, and returns the corresponding GPA range.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure:
-    /// - No concurrent operation touches the same bitmap bits.
-    pub unsafe fn claim_next_pending_run(
-        &self,
-        start: u64,
-        end: u64,
-    ) -> Result<Option<(u64, u64)>, AcceptError> {
-        let Some((first_bit, last_bit, unit_size)) = self.overlapping_bit_range(start, end) else {
-            return Ok(None);
-        };
-
-        // SAFETY: Public concurrent API contract guarantees valid writable bitmap
-        // payload and atomic-access discipline for overlapping ranges.
-        let bitmap = self.bitmap_ref();
-        let Some(run_start) = bitmap.find_next_set(first_bit, last_bit) else {
-            return Ok(None);
-        };
-        let run_end = bitmap
-            .find_next_zero(run_start, last_bit)
-            .unwrap_or(last_bit);
-
-        let gpa_start = Self::bit_to_gpa(self.phys_base, run_start, unit_size)?;
-        let gpa_end = Self::bit_to_gpa(self.phys_base, run_end, unit_size)?;
-
-        bitmap.clear_range(run_start, run_end);
-        Ok(Some((gpa_start, gpa_end)))
-    }
-
-    /// Re-sets bitmap bits for a GPA range whose TDX accept failed.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure:
-    /// - No concurrent operation touches the same bitmap bits.
-    /// - `start..end` is exactly a unit-aligned range previously returned by
-    ///   [`Self::claim_next_pending_run`] and has not been accepted or restored.
-    pub unsafe fn restore_pending_range(&self, start: u64, end: u64) {
-        let Some((first_bit, last_bit, _unit_size)) = self.overlapping_bit_range(start, end) else {
-            return;
-        };
-
-        // SAFETY: Public concurrent API contract guarantees valid writable bitmap
-        // payload and atomic-access discipline for overlapping ranges.
-        let bitmap = self.bitmap_ref();
-        bitmap.set_range(first_bit, last_bit);
-    }
-
-    fn bit_to_gpa(phys_base: u64, bit: BitIndex, unit_size: u64) -> Result<u64, AcceptError> {
-        let offset = bit
-            .checked_mul(unit_size)
-            .ok_or(AcceptError::ArithmeticOverflow)?;
-        phys_base
-            .checked_add(offset)
-            .ok_or(AcceptError::ArithmeticOverflow)
-    }
 }
+
+static ACCEPTANCE_STATE: Once<AcceptanceState> = Once::new();
