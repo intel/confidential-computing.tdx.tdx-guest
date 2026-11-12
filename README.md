@@ -65,12 +65,10 @@ The tdx-guest provides a Rust implementation of Intel® Trust Domain Extension
 
 ## On-demand memory acceptance
 
-The library also supports on-demand acceptance of guest-private memory.
-After registering an unaccepted-memory table, callers use `ensure_accepted()`
-before accessing allocated memory and supply a callback that disables local
-interrupts and returns a guard that restores their previous state when dropped.
-The library handles synchronization and pending-byte accounting.
+The library can defer acceptance of guest-private memory.
+Build an `EfiUnacceptedMemory` table, then call
+`EfiUnacceptedMemory::ensure_accepted` on a physical range before
+the first access. The callback must disable local interrupts and
+restore them when its guard is dropped.
 
-See the [`unaccepted_memory` module](src/unaccepted_memory/mod.rs) for table
-construction and the [acceptance API documentation](src/unaccepted_memory/accept.rs)
-for initialization, safety requirements, and error semantics.
+See the [`unaccepted_memory` module](src/unaccepted_memory/mod.rs).

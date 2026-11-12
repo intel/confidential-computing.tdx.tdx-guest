@@ -34,6 +34,9 @@ use crate::AcceptError;
 //   `align_of::<AtomicU64>()` and accessed only atomically.
 // - `unit_size_bytes` is a non-zero power of two, and `coverage_range()` does
 //   not overflow `u64`.
+// - Every set bit (`1`) in the trailing bitmap represents an unused
+//   guest-private memory unit awaiting TDX acceptance, and concurrent acceptance
+//   of this table's pending units goes through `Self::ensure_accepted`.
 #[derive(Debug)]
 #[repr(C)]
 pub struct EfiUnacceptedMemory {
